@@ -1,0 +1,7 @@
+aws_region          = "us-east-1"
+app_name            = "bkstg-made-nodejs-demo22"
+container_port      = 8080
+container_cpu       = 256
+container_memory    = 512
+dev_desired_count   = 1
+stage_desired_count = 1

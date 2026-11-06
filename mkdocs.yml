@@ -1,0 +1,6 @@
+site_name: bkstg-made-nodejs-demo22
+site_description: Documentation for bkstg-made-nodejs-demo22 microservice on Backstage IDP
+plugins:
+  - techdocs-core
+nav:
+  - Overview: index.md

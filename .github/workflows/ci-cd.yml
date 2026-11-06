@@ -1,0 +1,229 @@
+name: CI/CD Pipeline - ECS Deployment
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: 'Target Environment to deploy'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - dev
+          - stage
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: bkstg-made-nodejs-demo22
+  DEV_ECS_CLUSTER: bkstg-made-nodejs-demo22-dev
+  DEV_ECS_SERVICE: bkstg-made-nodejs-demo22-dev-svc
+  DEV_TASK_FAMILY: bkstg-made-nodejs-demo22-dev
+  STAGE_ECS_CLUSTER: bkstg-made-nodejs-demo22-stage
+  STAGE_ECS_SERVICE: bkstg-made-nodejs-demo22-stage-svc
+  STAGE_TASK_FAMILY: bkstg-made-nodejs-demo22-stage
+  CONTAINER_NAME: app
+
+jobs:
+  # ============================================================================
+  # Stage 1: Quality Gate & Unit Testing (ESLint & Jest)
+  # ============================================================================
+  test-and-lint:
+    name: Code Quality (ESLint) & Unit Tests (Jest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run Jest Unit Tests
+        run: npm test -- --ci --coverage
+
+  # ============================================================================
+  # Stage 2: Infrastructure as Code (Terraform) Validation
+  # ============================================================================
+  terraform-validate:
+    name: Terraform Format & Validation
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.3.4
+
+      - name: Terraform Format Check
+        run: terraform fmt -check
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  # ============================================================================
+  # Stage 3: Build & Push Container Image to Amazon ECR
+  # ============================================================================
+  build-and-push:
+    name: Build & Push Docker Image
+    needs: [test-and-lint, terraform-validate]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+      image_uri: ${{ steps.build-image.outputs.image }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Calculate Image Metadata
+        id: meta
+        run: |
+          IMAGE_TAG="${{ github.sha }}"
+          echo "tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Build, Tag, and Push Docker Image
+        id: build-image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+          IMAGE_LATEST="${REGISTRY}/${REPOSITORY}:latest"
+          IMAGE_BRANCH="${REGISTRY}/${REPOSITORY}:${{ github.ref_name }}"
+
+          docker build -t "$IMAGE_URI" -t "$IMAGE_LATEST" -t "$IMAGE_BRANCH" .
+          docker push "$IMAGE_URI"
+          docker push "$IMAGE_LATEST"
+          docker push "$IMAGE_BRANCH"
+
+          echo "image=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+  # ============================================================================
+  # Stage 4: Deploy to Dev ECS Cluster
+  # ============================================================================
+  deploy-dev:
+    name: Deploy to Dev Cluster
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.target_environment == 'all' || github.event.inputs.target_environment == 'dev'))
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Dev Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ env.DEV_TASK_FAMILY }}" \
+            --query taskDefinition | jq '. | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' > task-def-dev.json
+
+      - name: Render Dev Task Definition with New Image
+        id: render-dev-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def-dev.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push.outputs.image_uri }}
+
+      - name: Deploy to Dev ECS Cluster
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-dev-task-def.outputs.task-definition }}
+          service: ${{ env.DEV_ECS_SERVICE }}
+          cluster: ${{ env.DEV_ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  # ============================================================================
+  # Stage 5: Deploy to Stage ECS Cluster
+  # ============================================================================
+  deploy-stage:
+    name: Deploy to Stage Cluster
+    needs: [build-and-push, deploy-dev]
+    runs-on: ubuntu-latest
+    environment: staging
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.target_environment == 'all' || github.event.inputs.target_environment == 'stage'))
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Stage Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ env.STAGE_TASK_FAMILY }}" \
+            --query taskDefinition | jq '. | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' > task-def-stage.json
+
+      - name: Render Stage Task Definition with New Image
+        id: render-stage-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def-stage.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push.outputs.image_uri }}
+
+      - name: Deploy to Stage ECS Cluster
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-stage-task-def.outputs.task-definition }}
+          service: ${{ env.STAGE_ECS_SERVICE }}
+          cluster: ${{ env.STAGE_ECS_CLUSTER }}
+          wait-for-service-stability: true

@@ -1,0 +1,21 @@
+{
+  "name": "bkstg-made-nodejs-demo22",
+  "version": "1.0.0",
+  "description": "Node.js 20 microservice with SonarQube Quality Gate, Prometheus metrics and Fluentd/Loki logs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "jest",
+    "test:node": "node --test server.test.js",
+    "lint": "eslint ."
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "globals": "^17.14.0",
+    "jest": "^30.5.2"
+  }
+}
